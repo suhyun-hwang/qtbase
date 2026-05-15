@@ -60,8 +60,18 @@ static bool sendAsShortcut(const KeyEvent &keyEvent, QWindow *window)
     return NO;
 }
 
+// Defined in qnsview_complextext.mm (same translation unit). Hooks key
+// events early to run the Korean IME composer (workaround for
+// QTBUG-136128 / FB17460926). Returns true if the event was fully
+// consumed by the composer (e.g. Hangul-aware backspace decomposition).
+extern bool hangulComposerHookKeyDown(QNSView *view, NSEvent *nsevent);
+extern void hangulComposerMarkFlagsChanged();
+
 - (bool)handleKeyEvent:(NSEvent *)nsevent
 {
+    if (hangulComposerHookKeyDown(self, nsevent))
+        return true;
+
     qCDebug(lcQpaKeys) << "Handling" << nsevent;
     KeyEvent keyEvent(nsevent);
 
@@ -201,6 +211,13 @@ static bool sendAsShortcut(const KeyEvent &keyEvent, QWindow *window)
 
 - (void)flagsChanged:(NSEvent *)nsevent
 {
+    // Only Caps Lock (kVK_CapsLock=0x39) triggers the KR↔EN switch on
+    // this user's setup. Other modifier changes (Shift/Cmd/Ctrl/Opt)
+    // must NOT prime the post-flag predispatch — that would cause e.g.
+    // Cmd+A to commit 'a' into the input field.
+    if (nsevent.keyCode == kVK_CapsLock)
+        hangulComposerMarkFlagsChanged();
+
     // FIXME: Why are we not checking isTransparentForUserInput here?
 
     KeyEvent keyEvent(nsevent);

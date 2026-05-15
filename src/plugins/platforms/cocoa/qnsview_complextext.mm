@@ -3,6 +3,795 @@
 
 // This file is included from qnsview.mm, and only used to organize the code
 
+// ============================================================================
+// Hangul composer — workaround for QTBUG-136128 / FB17460926.
+//
+// On Qt 6 with the default macOS Korean IME (2-set / 3-set), Apple's IMK
+// dispatches raw 호환 자모 (Hangul compatibility jamo) to NSTextInputClient
+// instead of pre-composed Hangul syllables (also reported as Mozilla
+// #1233998). The dispatches arrive as a mix of compatibility jamo and
+// pre-composed syllables, with extra wrap-up / paired-commit dispatches
+// between key rounds.
+//
+// To work around the breakage in HTML inputs / QtWebEngine, we intercept
+// the NSTextInputClient surface (insertText / setMarkedText) and run a
+// 2-set state machine here. Syllables are emitted as commit-only
+// QInputMethodEvents (no preedit), which keeps Blink from painting the
+// yellow composition highlight while still letting Qt clients receive
+// well-formed Hangul syllables.
+//
+// Apple dispatch patterns observed:
+//   Cold (first syllable after locale switch):
+//     insertText  ㄱ   (cho)
+//     setMarkedText ㅏ (jung)
+//     setMarkedText ㅏ (dup)
+//     insertText  가   (paired commit)
+//   Warm:
+//     setMarkedText ㅎ (cho-only)
+//     setMarkedText 호 (syllable)
+//     setMarkedText 화 (복합 모음 syllable)
+//     setMarkedText 활 (받침 syllable)
+//     setMarkedText 홝 (복합 받침 syllable)
+//     setMarkedText 홝 (dup)
+//     insertText  홝   (paired commit)
+//
+// Additional quirks the composer must tolerate:
+//   - Cross-round wrap-up: IMK re-emits the last raw jamo of the prior
+//     syllable just before processing the new key (e.g. setMarkedText ㅏ
+//     in a ㅇ keyDown that follows the syllable 화).
+//   - 한영 (kVK_CapsLock) toggle orphan: IMK flushes the prior syllable's
+//     jong as a raw cons just after the toggle.
+//   - flagsChanged sometimes swallows the first keyDown after the KR↔EN
+//     switch; hookKeyDown predispatches in parallel with a dup window.
+// ============================================================================
+
+static inline bool isHangulCompatCho(ushort u)  { return u >= 0x3131 && u <= 0x314E; }
+static inline bool isHangulCompatJung(ushort u) { return u >= 0x314F && u <= 0x3163; }
+
+static inline bool isHangulCompatJamoSingle(const QString &s)
+{
+    if (s.size() != 1) return false;
+    const ushort u = s.at(0).unicode();
+    return isHangulCompatCho(u) || isHangulCompatJung(u);
+}
+
+static inline bool isHangulSyllableSingle(const QString &s)
+{
+    if (s.size() != 1) return false;
+    const ushort u = s.at(0).unicode();
+    return u >= 0xAC00 && u <= 0xD7A3;
+}
+
+// Compat consonant -> cho index. -1 for cluster-only compat consonants
+// (ㄳ/ㄵ/ㄶ/ㄺ/ㄻ/ㄼ/ㄽ/ㄾ/ㄿ/ㅀ/ㅄ) which cannot start a syllable.
+static int choIdxFromCompat(ushort u)
+{
+    switch (u) {
+    case 0x3131: return 0;   case 0x3132: return 1;   case 0x3134: return 2;
+    case 0x3137: return 3;   case 0x3138: return 4;   case 0x3139: return 5;
+    case 0x3141: return 6;   case 0x3142: return 7;   case 0x3143: return 8;
+    case 0x3145: return 9;   case 0x3146: return 10;  case 0x3147: return 11;
+    case 0x3148: return 12;  case 0x3149: return 13;  case 0x314A: return 14;
+    case 0x314B: return 15;  case 0x314C: return 16;  case 0x314D: return 17;
+    case 0x314E: return 18;
+    default:     return -1;
+    }
+}
+
+static int jungIdxFromCompat(ushort u)
+{
+    if (u < 0x314F || u > 0x3163) return -1;
+    return int(u) - 0x314F;
+}
+
+static int jongIdxFromCompat(ushort u)
+{
+    switch (u) {
+    case 0x3131: return 1;   case 0x3132: return 2;   case 0x3134: return 4;
+    case 0x3137: return 7;   case 0x3139: return 8;   case 0x3141: return 16;
+    case 0x3142: return 17;  case 0x3145: return 19;  case 0x3146: return 20;
+    case 0x3147: return 21;  case 0x3148: return 22;  case 0x314A: return 23;
+    case 0x314B: return 24;  case 0x314C: return 25;  case 0x314D: return 26;
+    case 0x314E: return 27;
+    default:     return 0;
+    }
+}
+
+// 복합 모음 components, indexed by jung idx (0..20). For single jung both are
+// -1. For 복합, .base is the first raw component, .second is the last.
+typedef struct { int base; int second; } JungCombo;
+static const JungCombo jungComboTable[21] = {
+    {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1}, {-1, -1},
+    {-1, -1}, {-1, -1}, {-1, -1},                             // 0..8: single
+    { 8,  0}, { 8,  1}, { 8, 20},                             // 9..11: ㅘㅙㅚ
+    {-1, -1}, {-1, -1},                                       // 12..13
+    {13,  4}, {13,  5}, {13, 20},                             // 14..16: ㅝㅞㅟ
+    {-1, -1}, {-1, -1},                                       // 17..18
+    {18, 20},                                                 // 19: ㅢ
+    {-1, -1},                                                 // 20: ㅣ
+};
+
+// 받침 이동 / 복합 받침 split, indexed by jong idx (0..27). For each jong:
+//   .movedCho   = cho idx of the cons that moves to the next syllable
+//   .remJong    = jong idx that stays in the prev syllable (0 if single)
+//   .baseCons   = first cons jong idx (for compound) — used by combine
+//   .addedCons  = second cons jong idx (for compound)
+// Single jong has baseCons = -1.
+typedef struct { int movedCho; int remJong; int baseCons; int addedCons; }
+    JongInfo;
+static const JongInfo jongInfoTable[28] = {
+    /*  0 none */ { -1, 0,  -1, -1 },
+    /*  1 ㄱ  */ {  0, 0,  -1, -1 },
+    /*  2 ㄲ  */ {  1, 0,  -1, -1 },
+    /*  3 ㄳ  */ {  9, 1,   1, 19 },  // ㄱ + ㅅ
+    /*  4 ㄴ  */ {  2, 0,  -1, -1 },
+    /*  5 ㄵ  */ { 12, 4,   4, 22 },  // ㄴ + ㅈ
+    /*  6 ㄶ  */ { 18, 4,   4, 27 },  // ㄴ + ㅎ
+    /*  7 ㄷ  */ {  3, 0,  -1, -1 },
+    /*  8 ㄹ  */ {  5, 0,  -1, -1 },
+    /*  9 ㄺ  */ {  0, 8,   8,  1 },  // ㄹ + ㄱ
+    /* 10 ㄻ  */ {  6, 8,   8, 16 },  // ㄹ + ㅁ
+    /* 11 ㄼ  */ {  7, 8,   8, 17 },  // ㄹ + ㅂ
+    /* 12 ㄽ  */ {  9, 8,   8, 19 },  // ㄹ + ㅅ
+    /* 13 ㄾ  */ { 16, 8,   8, 25 },  // ㄹ + ㅌ
+    /* 14 ㄿ  */ { 17, 8,   8, 26 },  // ㄹ + ㅍ
+    /* 15 ㅀ  */ { 18, 8,   8, 27 },  // ㄹ + ㅎ
+    /* 16 ㅁ  */ {  6, 0,  -1, -1 },
+    /* 17 ㅂ  */ {  7, 0,  -1, -1 },
+    /* 18 ㅄ  */ {  9,17,  17, 19 },  // ㅂ + ㅅ
+    /* 19 ㅅ  */ {  9, 0,  -1, -1 },
+    /* 20 ㅆ  */ { 10, 0,  -1, -1 },
+    /* 21 ㅇ  */ { 11, 0,  -1, -1 },
+    /* 22 ㅈ  */ { 12, 0,  -1, -1 },
+    /* 23 ㅊ  */ { 14, 0,  -1, -1 },
+    /* 24 ㅋ  */ { 15, 0,  -1, -1 },
+    /* 25 ㅌ  */ { 16, 0,  -1, -1 },
+    /* 26 ㅍ  */ { 17, 0,  -1, -1 },
+    /* 27 ㅎ  */ { 18, 0,  -1, -1 },
+};
+
+static int  combineJung(int prev, int newJung)
+{
+    for (int i = 9; i < 21; i++) {
+        if (jungComboTable[i].base == prev && jungComboTable[i].second == newJung)
+            return i;
+    }
+    return -1;
+}
+static bool isUpgradeOfJung(int prev, int incoming)
+{
+    return incoming >= 0 && incoming < 21
+        && jungComboTable[incoming].base == prev;
+}
+static int  lastRawJungOf(int combined)
+{
+    if (combined < 0 || combined >= 21) return -1;
+    return jungComboTable[combined].second;
+}
+static int  movedChoFromJong(int jong)
+{
+    if (jong <= 0 || jong >= 28) return -1;
+    return jongInfoTable[jong].movedCho;
+}
+static int  remainingJongAfterMove(int jong)
+{
+    if (jong <= 0 || jong >= 28) return 0;
+    return jongInfoTable[jong].remJong;
+}
+
+// cho idx → compat consonant char (preview when only cho is set).
+static QChar compatChoFromIdx(int choIdx)
+{
+    static const ushort table[19] = {
+        0x3131, 0x3132, 0x3134, 0x3137, 0x3138, 0x3139, 0x3141,
+        0x3142, 0x3143, 0x3145, 0x3146, 0x3147, 0x3148, 0x3149,
+        0x314A, 0x314B, 0x314C, 0x314D, 0x314E
+    };
+    if (choIdx < 0 || choIdx > 18) return QChar();
+    return QChar(table[choIdx]);
+}
+
+
+// ============================================================================
+// HangulComposer — 2-set Korean state machine + Apple-IME dispatch tolerance
+// ============================================================================
+//
+// State carries across keyDowns until reset(). Round-local fields are reset
+// at enterRound() (called from hookKeyDown).
+//
+// Public API:
+//   reset / hasState / enterRound  — lifecycle
+//   feedCompatJamo                  — 호환 자모 한 개 처리 (cho 0x3131..0x314E,
+//                                    jung 0x314F..0x3163)
+//   feedSyllable                    — Hangul Syllable 한 개 처리 (0xAC00..0xD7A3)
+//   handleBackspace                 — libhangul-style 분해
+//
+// All emits go through emitCurrent() / commit helpers — commit-only, no
+// preedit, so Blink never paints the composition highlight.
+struct HangulComposer {
+    // 합성 중인 syllable 상태 — keyDown 간 유지, reset() 까지.
+    int cho = -1;              // 0..18 or -1 (없음)
+    int jung = -1;             // 0..20 or -1
+    int jong = 0;              // 0=없음, 1..27
+    int lastCommittedLen = 0;  // 다음 emit 시 replace 할 chars 수
+
+    // 한 키 라운드 내에서만 유효 — enterRound() 에서 초기화.
+    // fedXThisRound: 이 라운드 안에서 X (cho/jung/jong) 카테고리를
+    // 한 번이라도 새로 integrate 했으면 true. Apple 의 cold dup /
+    // 같은 라운드 wrap-up 을 cross-round 의 같은 jamo 입력과 구분.
+    //   - cross-round (fed=false): 새 입력으로 간주, finalize+integrate
+    //   - within-round (fed=true): dup wrap-up, DROP-preserve
+    ushort keyChar = 0;        // 현재 keyDown 의 chars[0]
+    bool fedChoThisRound = false;
+    bool fedJungThisRound = false;
+    bool fedJongThisRound = false;
+
+    void reset();
+    bool hasState() const;
+    void enterRound(ushort kc);
+
+    void feedCompatJamo(QNSView *view, ushort u);
+    void feedSyllable(QNSView *view, QChar ch);
+    bool handleBackspace(QNSView *view);
+
+    QString preeditPreview() const;
+
+private:
+    void emitCurrent(QNSView *view);
+    void commitAndClear();
+};
+
+// Single composer instance (main-thread only — file-static safe).
+static HangulComposer composer;
+
+// Apple-IME-quirk state — flagsChanged (Caps Lock = 한영) 직후 IMK 가 첫
+// keyDown 을 삼키는 경우가 있어, 다음 keyDown 에서 우리가 parallel-path 로
+// 직접 dispatch + IMK 의 동일 dispatch 가 도착하면 dup suppression.
+static bool flagsChangedPending = false;
+static unichar postFlagChar = 0;
+static NSTimeInterval postFlagTimestamp = 0;
+static const NSTimeInterval postFlagWindowSec = 0.2;
+
+void hangulComposerMarkFlagsChanged() { flagsChangedPending = true; }
+
+
+// --- HangulComposer method bodies ---
+
+void HangulComposer::reset()
+{
+    cho = -1;
+    jung = -1;
+    jong = 0;
+    lastCommittedLen = 0;
+}
+
+bool HangulComposer::hasState() const
+{
+    return cho >= 0 || jung >= 0 || jong > 0 || lastCommittedLen > 0;
+}
+
+void HangulComposer::enterRound(ushort kc)
+{
+    keyChar = kc;
+    fedChoThisRound = false;
+    fedJungThisRound = false;
+    fedJongThisRound = false;
+}
+
+void HangulComposer::commitAndClear()
+{
+    cho = -1;
+    jung = -1;
+    jong = 0;
+    lastCommittedLen = 0;
+}
+
+QString HangulComposer::preeditPreview() const
+{
+    if (cho >= 0 && jung >= 0) {
+        const int idx = (cho * 21 + jung) * 28 + jong;
+        return QString(QChar(ushort(0xAC00 + idx)));
+    }
+    if (cho >= 0)  return QString(compatChoFromIdx(cho));
+    if (jung >= 0) return QString(QChar(ushort(0x314F + jung)));
+    return QString();
+}
+
+// Emit current state as commit + replacement of our own previous emission.
+// Empty state with lastCommittedLen>0 clears the previous emission.
+void HangulComposer::emitCurrent(QNSView *view)
+{
+    QObject *focusObject = view.focusObject;
+    if (!focusObject || !queryInputMethod(focusObject))
+        return;
+
+    QString preview;
+    if (cho >= 0 && jung >= 0) {
+        const int idx = (cho * 21 + jung) * 28 + jong;
+        preview = QString(QChar(ushort(0xAC00 + idx)));
+    } else if (cho >= 0) {
+        preview = QString(compatChoFromIdx(cho));
+    } else if (jung >= 0) {
+        preview = QString(QChar(ushort(0x314F + jung)));
+    } else {
+        if (lastCommittedLen > 0) {
+            QInputMethodEvent ev;
+            ev.setCommitString(QString(), -lastCommittedLen, lastCommittedLen);
+            QCoreApplication::sendEvent(focusObject, &ev);
+        }
+        lastCommittedLen = 0;
+        return;
+    }
+
+    QInputMethodEvent ev;
+    ev.setCommitString(preview, -lastCommittedLen, lastCommittedLen);
+    QCoreApplication::sendEvent(focusObject, &ev);
+    lastCommittedLen = preview.length();
+}
+
+// Feed one 호환 자모 through the FSM. Nodes: S0 (empty) / S1 (cho) /
+// S2 (cho+jung) / S3 (cho+jung+jong). Each Apple dispatch either:
+//   1) extends the current node along a valid transition, OR
+//   2) is a wrap-up / dup of state we already hold → DROP-preserve, OR
+//   3) cannot extend further → finalize current node + restart fresh.
+//
+// Dup vs new-input disambiguation:
+//   - JUNG (full or last-raw of compound) matching state.jung: always
+//     wrap-up DROP, except in S3 where keyChar==jungCompat → 받침이동.
+//   - CHO matching state.cho: DROP only if fedChoThisRound (cold dup).
+//     fedChoThisRound=false means cross-round → integrate (ㄱㄱ).
+//   - JONG (full or compound's addedCons) matching state.jong: always
+//     wrap-up DROP.
+void HangulComposer::feedCompatJamo(QNSView *view, ushort u)
+{
+    const int newCho    = choIdxFromCompat(u);
+    const int newJung   = jungIdxFromCompat(u);
+    const int jongFromU = jongIdxFromCompat(u);
+    const bool isCons   = (newCho >= 0);
+    const bool isVow    = (newJung >= 0);
+    if (!isCons && !isVow)
+        return;
+
+    // 한영 orphan jong flush — Apple 이 한영 토글 직후 직전 syllable 의
+    // jong (단일/복합 전체 또는 복합의 마지막 raw cons) 를 flush.
+    // FSM 외부 가드 (state 보존).
+    if (flagsChangedPending && jong > 0 && isCons && jongFromU > 0) {
+        const int added = jongInfoTable[jong].addedCons;
+        if (jongFromU == jong || (added > 0 && jongFromU == added))
+            return;
+    }
+
+    // === Wrap-up / dup detection (DROP-preserve, no state change) ===
+    //
+    // 세 카테고리 (jung / cho / jong) 모두 동일한 게이트:
+    //   (1) fedXThisRound — 같은 라운드 안 재-dispatch (cold dup).
+    //   (2) keyChar != u — 사용자가 이 키를 누른게 아닌데 dispatch 됨
+    //       (cross-round wrap-up, 예: ㄱㄴ 의 ㄴ keyDown 에서 Apple 이
+    //       prev marked ㄱ 을 insertText ㄱ 로 commit-signal; 갉+ㅏ 의
+    //       ㄱ wrap-up).
+    // 둘 다 false 면 사용자의 새 입력 → 통과 (ㄱㄱ, 각+ㄱ → 각ㄱ,
+    // 글+ㄹ → 글ㄹ 등 "더 이상 갈 수 없는 노드 → finalize + 새로 열기").
+    //
+    // 단, S3 에서 jung dup 는 받침이동 trigger 가능성이 있어 별도 처리 —
+    // keyChar == jungCompat 일 때만 받침이동 분기로 통과.
+
+    if (isVow && jung >= 0) {
+        const bool fullDup    = (newJung == jung);
+        const bool lastRawDup = (lastRawJungOf(jung) == newJung);
+        if (fullDup || lastRawDup) {
+            const ushort jungCompat = ushort(0x314F + newJung);
+            if (jong > 0) {
+                // S3: 받침이동 disambiguation 우선
+                if (keyChar != jungCompat)
+                    return;
+                // fall through to 받침이동 (S3 + jung)
+            } else {
+                if (fedJungThisRound)
+                    return;
+                if (keyChar != jungCompat)
+                    return;
+            }
+        }
+    }
+
+    if (isCons && cho >= 0 && newCho == cho) {
+        if (fedChoThisRound)
+            return;
+        if (keyChar != u)
+            return;
+    }
+
+    if (isCons && jong > 0 && jongFromU > 0) {
+        const int added = jongInfoTable[jong].addedCons;
+        if (jongFromU == jong || (added > 0 && jongFromU == added)) {
+            if (fedJongThisRound)
+                return;
+            if (keyChar != u)
+                return;
+        }
+    }
+
+    // === FSM transitions ===
+
+    if (jong > 0) {
+        // S3 (cho + jung + jong)
+        if (isCons) {
+            // jong combine 또는 새 syllable (finalize+restart).
+            int combined = 0;
+            int prevJ = jong, nxt = jongFromU;
+            if      (prevJ == 1  && nxt == 19) combined = 3;
+            else if (prevJ == 4  && nxt == 22) combined = 5;
+            else if (prevJ == 4  && nxt == 27) combined = 6;
+            else if (prevJ == 8  && nxt == 1)  combined = 9;
+            else if (prevJ == 8  && nxt == 16) combined = 10;
+            else if (prevJ == 8  && nxt == 17) combined = 11;
+            else if (prevJ == 8  && nxt == 19) combined = 12;
+            else if (prevJ == 8  && nxt == 25) combined = 13;
+            else if (prevJ == 8  && nxt == 26) combined = 14;
+            else if (prevJ == 8  && nxt == 27) combined = 15;
+            else if (prevJ == 17 && nxt == 19) combined = 18;
+            if (combined > 0) {
+                jong = combined;
+                fedJongThisRound = true;
+            } else {
+                commitAndClear();
+                cho = newCho;
+                fedChoThisRound = true;
+            }
+        } else {
+            // S3 + jung → 받침이동
+            const int movedCho = jongInfoTable[jong].movedCho;
+            const int rem      = jongInfoTable[jong].remJong;
+            jong = rem;
+            commitAndClear();
+            cho = (movedCho >= 0 ? movedCho : 11);
+            jung = newJung;
+            fedJungThisRound = true;
+        }
+        emitCurrent(view);
+        return;
+    }
+
+    if (cho >= 0 && jung >= 0) {
+        // S2 (cho + jung)
+        if (isVow) {
+            // Jung upgrade: state.jung 이 incoming combined 의 BASE.
+            // Apple cold pattern 이 ㅗ marked → ㅏ keyDown 시 combined
+            // ㅘ 를 setMarkedText 로 직접 dispatch.
+            if (isUpgradeOfJung(jung, newJung)) {
+                jung = newJung;
+                fedJungThisRound = true;
+            } else {
+                const int combined = combineJung(jung, newJung);
+                if (combined >= 0) {
+                    jung = combined;
+                    fedJungThisRound = true;
+                } else {
+                    // 같은 jung 도 아니고 combine 도 upgrade 도 아님 →
+                    // 새 syllable orphan jung.
+                    commitAndClear();
+                    jung = newJung;
+                    fedJungThisRound = true;
+                }
+            }
+        } else {
+            if (jongFromU > 0) {
+                jong = jongFromU;
+                fedJongThisRound = true;
+            } else {
+                commitAndClear();
+                cho = newCho;
+                fedChoThisRound = true;
+            }
+        }
+        emitCurrent(view);
+        return;
+    }
+
+    if (cho >= 0) {
+        // S1 (cho only). 같은 cho 의 within-round dup 는 위에서 이미 DROP.
+        // 여기 도달했다면 cross-round 새 입력 (ㄱㄱ) 또는 다른 cho.
+        if (isCons) {
+            commitAndClear();
+            cho = newCho;
+            fedChoThisRound = true;
+        } else {
+            jung = newJung;
+            fedJungThisRound = true;
+        }
+        emitCurrent(view);
+        return;
+    }
+
+    if (jung >= 0) {
+        // jung only (드물지만 가능 — 위 wrap-up DROP 후 cleared 등).
+        if (isVow) {
+            const int combined = combineJung(jung, newJung);
+            if (combined >= 0) {
+                jung = combined;
+                fedJungThisRound = true;
+            } else {
+                commitAndClear();
+                jung = newJung;
+                fedJungThisRound = true;
+            }
+        } else {
+            commitAndClear();
+            cho = newCho;
+            fedChoThisRound = true;
+        }
+        emitCurrent(view);
+        return;
+    }
+
+    // S0 (empty)
+    if (isCons) {
+        cho = newCho;
+        fedChoThisRound = true;
+    } else {
+        jung = newJung;
+        fedJungThisRound = true;
+    }
+    emitCurrent(view);
+}
+
+// Apple dispatched a pre-composed syllable (warm path). Trust it, with two
+// special transitions:
+//   1. 받침 이동: state has jong and the new syllable's cho equals state's
+//      movedCho → commit prev as (cho, jung, remJong) and append new.
+//   2. cho mismatch: state has wrong cho (Apple absorbed cons as 받침 we
+//      should have treated as new syllable cho) → rewind prev, strip jong,
+//      append new.
+void HangulComposer::feedSyllable(QNSView *view, QChar ch)
+{
+    QObject *focusObject = view.focusObject;
+    if (!focusObject || !queryInputMethod(focusObject))
+        return;
+
+    // Paired commit / warm dup: Apple dispatches the same syllable we
+    // already emitted as preedit (cold paired insertText 가, warm dup
+    // setMarkedText 홝). Swallow without state change.
+    if (preeditPreview() == QString(ch))
+        return;
+
+    const int code   = ch.unicode() - 0xAC00;
+    const int inCho  = code / (21 * 28);
+    const int inJung = (code % (21 * 28)) / 28;
+    const int inJong = code % 28;
+
+    // 받침이동 prev-split detection. Cross-jung 받침이동 에서 Apple 은
+    // post-split prev 와 new syllable 을 두 dispatch 로 나눠 보냄 (예:
+    // 각+ㅗ → setMarkedText "가" + setMarkedText "고", 갉+ㅏ →
+    // setMarkedText "갈" + setMarkedText "가"). 첫 dispatch 가 (cho,
+    // jung, remJong) 형태인 prev-split 일 때 prev 를 잠그고 state 를
+    // (cho, jung, rem) 유지 — paired commit insertText "가" 는 preedit
+    // -match DROP, 후속 new syllable setMarkedText 는 lastCommittedLen=0
+    // 으로 simple-replace 가 append 처리.
+    //
+    // 같은 representation 케이스 (가가, 가+가가 같은 prev-split == new-
+    // syllable) 에서는 Apple 이 single dispatch 만 보냄 — diffJung OR
+    // diffJong 조건으로 single-dispatch 케이스 (아래 받침이동 syllable
+    // rule) 와 구분.
+    if (jong > 0 && jung >= 0 && cho >= 0 && lastCommittedLen > 0
+        && cho == inCho && jung == inJung) {
+        const int rem = remainingJongAfterMove(jong);
+        if (inJong == rem) {
+            const ushort prevJungCompat = ushort(0x314F + jung);
+            const bool diffJung = (keyChar != prevJungCompat);
+            const bool diffJong = (rem != 0);
+            if (diffJung || diffJong) {
+                const int prevIdx = (cho * 21 + jung) * 28 + rem;
+                const QChar prev(ushort(0xAC00 + prevIdx));
+                QInputMethodEvent ev;
+                ev.setCommitString(QString(prev), -lastCommittedLen, lastCommittedLen);
+                QCoreApplication::sendEvent(focusObject, &ev);
+                jong = rem;
+                lastCommittedLen = 0;
+                return;
+            }
+        }
+    }
+
+    // 받침 이동 syllable transition (single-dispatch): state cho+jung+jong
+    // (받침) 인데 사용자가 모음 키를 누른 결과로 Apple 이 movedCho(state.jong)
+    // 를 새 syllable 의 cho 로 한 syllable 을 dispatch (각+ㅏ → 가+가:
+    // setMarkedText "가" 한 번으로 prev-split 과 new 가 동일).
+    // keyChar 가 새 syllable jung 의 호환 모음 자체일 때만 fire — 그렇지
+    // 않으면 같은 syllable 의 jong 변경 (예: 곽 → 과 finalize) 와 구분 안 됨.
+    if (jong > 0 && jung >= 0 && cho >= 0 && lastCommittedLen > 0) {
+        const int movedCho = movedChoFromJong(jong);
+        const ushort jungCompat = ushort(0x314F + inJung);
+        const bool keyIsNewJung = (keyChar == jungCompat);
+        if (movedCho >= 0 && movedCho == inCho && keyIsNewJung) {
+            const int rem = remainingJongAfterMove(jong);
+            const int prevIdx = (cho * 21 + jung) * 28 + rem;
+            const QChar prev(ushort(0xAC00 + prevIdx));
+            QString combined;
+            combined.append(prev);
+            combined.append(ch);
+            QInputMethodEvent ev;
+            ev.setCommitString(combined, -lastCommittedLen, lastCommittedLen);
+            QCoreApplication::sendEvent(focusObject, &ev);
+            lastCommittedLen = 1;
+            cho = inCho;
+            jung = inJung;
+            jong = inJong;
+            return;
+        }
+    }
+
+    // cho mismatch: rewind prev emit, strip jong
+    if (cho >= 0 && cho != inCho && lastCommittedLen > 0) {
+        QInputMethodEvent ev;
+        if (jong > 0 && jung >= 0) {
+            const int fixedIdx = (cho * 21 + jung) * 28 + 0;
+            const QChar fixed(ushort(0xAC00 + fixedIdx));
+            QString combined;
+            combined.append(fixed);
+            combined.append(ch);
+            ev.setCommitString(combined, -lastCommittedLen, lastCommittedLen);
+        } else {
+            ev.setCommitString(QString(ch), 0, 0);
+        }
+        QCoreApplication::sendEvent(focusObject, &ev);
+        lastCommittedLen = 1;
+    } else {
+        QInputMethodEvent ev;
+        ev.setCommitString(QString(ch), -lastCommittedLen, lastCommittedLen);
+        QCoreApplication::sendEvent(focusObject, &ev);
+        lastCommittedLen = 1;
+    }
+
+    cho = inCho;
+    jung = inJung;
+    jong = inJong;
+}
+
+// libhangul / standard 한국어 IME 분해 정책 backspace.
+// Returns true if the event was handled.
+bool HangulComposer::handleBackspace(QNSView *view)
+{
+    if (jong > 0) {
+        // 복합 받침 → 단일 받침 (or 단일 받침 → 없음)
+        static const struct { int from; int to; } split[] = {
+            {3,1}, {5,4}, {6,4}, {9,8}, {10,8}, {11,8},
+            {12,8}, {13,8}, {14,8}, {15,8}, {18,17}
+        };
+        int newJong = 0;
+        for (auto &e : split) {
+            if (e.from == jong) { newJong = e.to; break; }
+        }
+        jong = newJong;
+        emitCurrent(view);
+        return true;
+    }
+    if (cho >= 0 && jung >= 0) {
+        // 복합 모음 → base, or jung 통째로 제거
+        static const struct { int from; int to; } split[] = {
+            {9,8}, {10,8}, {11,8}, {14,13}, {15,13}, {16,13}, {19,18}
+        };
+        int newJung = -1;
+        for (auto &e : split) {
+            if (e.from == jung) { newJung = e.to; break; }
+        }
+        jung = newJung;
+        emitCurrent(view);
+        return true;
+    }
+    if (cho >= 0 || jung >= 0) {
+        cho = -1;
+        jung = -1;
+        emitCurrent(view);
+        return true;
+    }
+    return false;
+}
+
+
+// ============================================================================
+// hookKeyDown — called from qnsview_keys.mm at the top of -handleKeyEvent:.
+// ============================================================================
+//
+// Backspace 는 항상 우리가 consume — composer state 가 없을 때라도. Apple IME
+// 가 자체 버퍼로 decomposition dispatch (setMarkedText syllable 또는 compat
+// jamo) 를 보내면 우리가 commit-only emit 으로 이미 지운 글자가 다시 살아나는
+// race ('가나다🔙🔙🔙🔙ㄴ → 단') 가 발생.
+//
+// Returns true if the event was fully handled (stock path skip).
+bool hangulComposerHookKeyDown(QNSView *view, NSEvent *nsevent)
+{
+    if (nsevent.type != NSEventTypeKeyDown)
+        return false;
+
+    NSString *chars = nsevent.characters;
+    if (chars.length == 0)
+        return false;
+    const unichar c = [chars characterAtIndex:0];
+
+    composer.enterRound(c);
+
+    // 한영 직후 첫 keyDown — parallel predispatch + dup window.
+    // IMK 가 가끔 첫 keyDown 을 삼키므로 우리가 직접 dispatch (stock path 도
+    // 그대로 진행). insertText/setMarkedText 의 post-flag dup 검사가 IMK 의
+    // 중복 dispatch 를 잡아 한 글자만 emit.
+    if (flagsChangedPending) {
+        flagsChangedPending = false;
+        const bool isControl = (c < 0x20) || (c == 0x7F)
+                            || (c >= 0xF700 && c <= 0xF8FF);
+        const bool hasModifier = (nsevent.modifierFlags
+            & (NSEventModifierFlagCommand | NSEventModifierFlagControl
+               | NSEventModifierFlagOption)) != 0;
+        if (!isControl && !hasModifier) {
+            postFlagChar = c;
+            postFlagTimestamp = [[NSDate date] timeIntervalSince1970];
+            // 한영 직후 새 글자 — state 비우고 fresh 시작. State 유지 시
+            // 가{한영}가 → 각가 처럼 새 cho 가 직전 syllable 받침으로 흡수됨.
+            composer.reset();
+            if (c >= 0x3131 && c <= 0x3163) {
+                composer.feedCompatJamo(view, c);
+            } else if (c >= 0xAC00 && c <= 0xD7A3) {
+                composer.feedSyllable(view, [chars characterAtIndex:0]);
+            } else {
+                QObject *focusObject = view.focusObject;
+                if (focusObject && queryInputMethod(focusObject)) {
+                    QInputMethodEvent ev;
+                    ev.setCommitString(QString::fromNSString(chars), 0, 0);
+                    QCoreApplication::sendEvent(focusObject, &ev);
+                }
+            }
+            // Fall through (return false) so stock path also runs.
+        }
+    }
+
+    // space / tab / enter — Apple IME treats as commit-and-insert. Drop our
+    // cycle + Apple's marked buffer to avoid syllable finalize duplicates
+    // ('초격차차 기술술' regression sample).
+    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+        if (composer.hasState())
+            composer.reset();
+        [view.inputContext discardMarkedText];
+        return false;
+    }
+
+    // backspace (0x08 BS or 0x7F DEL) — selection-aware delete or composer
+    // step-decompose. Always wipe Apple's marked buffer so it cannot replay
+    // a stale syllable on the next keystroke.
+    if (c == 0x08 || c == 0x7F) {
+        QObject *focusObject = view.focusObject;
+        int anchor = -1, cursor = -1;
+        if (focusObject) {
+            if (auto qr = queryInputMethod(focusObject,
+                    Qt::ImAnchorPosition | Qt::ImCursorPosition)) {
+                anchor = qr.value(Qt::ImAnchorPosition).toInt();
+                cursor = qr.value(Qt::ImCursorPosition).toInt();
+            }
+        }
+        const bool hasSelection = (anchor >= 0 && cursor >= 0 && anchor != cursor);
+
+        if (hasSelection) {
+            composer.reset();
+            if (focusObject && queryInputMethod(focusObject)) {
+                const int selStart = std::min(anchor, cursor);
+                const int selEnd   = std::max(anchor, cursor);
+                QInputMethodEvent ev;
+                ev.setCommitString(QString(), selStart - cursor, selEnd - selStart);
+                QCoreApplication::sendEvent(focusObject, &ev);
+            }
+        } else if (composer.hasState()) {
+            composer.handleBackspace(view);
+        } else {
+            if (focusObject && queryInputMethod(focusObject)) {
+                QInputMethodEvent ev;
+                ev.setCommitString(QString(), -1, 1);
+                QCoreApplication::sendEvent(focusObject, &ev);
+            }
+        }
+        [view.inputContext discardMarkedText];
+        return true;
+    }
+    return false;
+}
+
 @implementation QNSView (ComplexText)
 
 // ------------- Text insertion -------------
@@ -38,12 +827,50 @@
     the current selection, or just insert the text at the current
     cursor location.
 */
+
 - (void)insertText:(id)text replacementRange:(NSRange)replacementRange
 {
     qCDebug(lcQpaKeys).nospace() << "Inserting \"" << text << "\""
         << ", replacing range " << replacementRange;
 
     NSString *string = [self stringForText:text];
+
+    // post-flag dup suppression: if IMK ends up dispatching the same char
+    // we already predispatched, drop the duplicate. Also clear m_sendKeyEvent
+    // so the raw keyDown is not delivered to Qt either.
+    if (postFlagChar != 0 && string.length == 1) {
+        unichar in = [string characterAtIndex:0];
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (in == postFlagChar && (now - postFlagTimestamp) < postFlagWindowSec) {
+            postFlagChar = 0;
+            m_sendKeyEvent = false;
+            return;
+        }
+        postFlagChar = 0;
+    }
+
+    {
+        QString s = QString::fromNSString(string);
+        if (isHangulCompatJamoSingle(s)) {
+            // insertText 도 compat jamo 면 FSM 으로 직접 라우팅.
+            // dup / wrap-up 판단은 feedCompatJamo 안에서 통합 처리 —
+            // 별도 jungPaired / choOnlyPaired 가드 불필요.
+            composer.feedCompatJamo(self, s.at(0).unicode());
+            return;
+        }
+        if (isHangulSyllableSingle(s)) {
+            // insertText syllable 도 feedSyllable 로 라우팅 — preedit-match
+            // 가드가 cold paired commit (state==preedit) / 받침이동 후속
+            // paired+dup / warm dup 을 전부 DROP-preserve.
+            // 과거 reset() 처리는 받침이동 직후 paired insertText 가 state
+            // 를 날려서 후속 setMarkedText 가 가 새 syllable 로 누적되는
+            // 회귀 발생 (가가가 → 가가가가).
+            composer.feedSyllable(self, s.at(0));
+            return;
+        }
+        if (composer.hasState())
+            composer.reset();
+    }
 
     if (m_composingText.isEmpty()) {
         // The input method may have transformed the incoming key event
@@ -168,6 +995,29 @@
 
     const bool isAttributedString = [text isKindOfClass:NSAttributedString.class];
     QString preeditString = QString::fromNSString([self stringForText:text]);
+
+    // post-flag dup suppression
+    if (postFlagChar != 0 && preeditString.length() == 1) {
+        unichar in = preeditString.at(0).unicode();
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (in == postFlagChar && (now - postFlagTimestamp) < postFlagWindowSec) {
+            postFlagChar = 0;
+            m_sendKeyEvent = false;
+            return;
+        }
+        postFlagChar = 0;
+    }
+
+    if (isHangulCompatJamoSingle(preeditString)) {
+        composer.feedCompatJamo(self, preeditString.at(0).unicode());
+        return;
+    }
+    if (isHangulSyllableSingle(preeditString)) {
+        composer.feedSyllable(self, preeditString.at(0));
+        return;
+    }
+    if (composer.hasState())
+        composer.reset();
 
     QList<QInputMethodEvent::Attribute> preeditAttributes;
 
@@ -327,6 +1177,9 @@
 */
 - (void)unmarkText
 {
+    // End the Hangul composer cycle on explicit unmark.
+    composer.reset();
+
     // FIXME: Match cancelComposingText in early exit and focus object handling
 
     qCDebug(lcQpaKeys) << "Unmarking" << m_composingText
@@ -354,6 +1207,9 @@
 */
 - (void)cancelComposingText
 {
+    // End the Hangul composer cycle on explicit cancel.
+    composer.reset();
+
     if (m_composingText.isEmpty())
         return;
 
@@ -373,6 +1229,9 @@
 
 - (void)doCommandBySelector:(SEL)selector
 {
+    if (composer.hasState())
+        composer.reset();
+
     // Note: if the selector cannot be invoked, then doCommandBySelector:
     // should not pass this message up the responder chain (nor should it
     // call super, as the NSResponder base class would in that case pass
