@@ -286,7 +286,9 @@ void hangulComposerMarkFlagsChanged() { flagsChangedPending = true; }
 //   - A cache that matches none of them means the edit target changed (e.g.
 //     page JS moved DOM focus to another field) or the text was edited from
 //     outside. Held edits are dropped and the composer is reset on the next
-//     keyDown, so stale edits never land in another field.
+//     keyDown, so stale edits never land in another field. A match whose caret
+//     (ImCursorRectangle) jumped further than the edits could move it is
+//     another field with the same text and cursor, and is not trusted either.
 //   - Backspace is held as an intent and resolved against the selection that
 //     exists when it is sent, not when the key was pressed.
 //   - No edit is ever sent unverified. While the cache stays behind the
@@ -298,9 +300,12 @@ void hangulComposerMarkFlagsChanged() { flagsChangedPending = true; }
 //     then held edits are dropped), so they cannot overtake composer edits and
 //     the cache is current when they start. Such a key edits through the stock
 //     path; afterwards plain inserts go out at once (the renderer inserts at
-//     its own caret), and relative edits wait until the cache shows those
-//     inserts before the caret, then the model is rebuilt from the cache. When
-//     nothing was inserted, the cache is trusted once its cursor moves or after
+//     its own caret), and relative edits wait until the cache differs from the
+//     state before the key (text, cursor and selection) and shows those
+//     inserts before the caret, then the model is rebuilt from the cache. A
+//     plain Backspace with nothing inserted is delivered as a key event, so the
+//     renderer applies it in order without a cached range. Other relative
+//     edits with nothing inserted trust the cache once it changes or after
 //     kNoOpForeignKeyTrustMs (keys that change nothing, e.g. Esc).
 // Widgets that answer input method queries synchronously always match the
 // model, so the queue never forms for them.
@@ -309,6 +314,7 @@ struct HangulTextState {
     QString text;
     int cursor = 0;
     int anchor = 0;
+    QRect caret;    // ImCursorRectangle in focus-object coordinates, may be invalid
 };
 
 struct PendingHangulEdit {
@@ -327,7 +333,7 @@ static bool modelValid = false;             // confirmedState/inflightStates des
 static HangulTextState confirmedState;      // last state the cache was seen in
 static QList<HangulTextState> inflightStates; // expected states of sent, unconfirmed edits
 static bool cursorCacheUntrusted = false;   // a foreign key has not been reported yet
-static int untrustedSnapshotCursor = -1;
+static HangulTextState untrustedSnapshot;  // cache seen right before the foreign key
 static QString untrustedInserts;            // plain inserts sent since the foreign key
 static QElapsedTimer untrustedSince;
 static bool composerResetPending = false;   // target changed under held edits
@@ -337,18 +343,38 @@ static QTimer *staleCursorTimer = nullptr;
 static bool queryTextState(QObject *object, HangulTextState *state)
 {
     auto qr = queryInputMethod(object,
-        Qt::ImSurroundingText | Qt::ImCursorPosition | Qt::ImAnchorPosition);
+        Qt::ImSurroundingText | Qt::ImCursorPosition | Qt::ImAnchorPosition
+        | Qt::ImCursorRectangle);
     if (!qr)
         return false;
     state->text = qr.value(Qt::ImSurroundingText).toString();
     state->cursor = qr.value(Qt::ImCursorPosition).toInt();
     state->anchor = qr.value(Qt::ImAnchorPosition).toInt();
+    state->caret = qr.value(Qt::ImCursorRectangle).toRect();
     return true;
 }
 
 static bool sameTextAndCursor(const HangulTextState &a, const HangulTextState &b)
 {
     return a.cursor == b.cursor && a.text == b.text;
+}
+
+// Whether the caret could have moved from `from` to `to` through `edits`
+// edits in the same field: along the line by a few glyphs, or onto an
+// adjacent line when the text wraps. A jump beyond that means another field
+// with the same text and cursor took focus. Unknown rectangles pass.
+static bool caretMovePlausible(const HangulTextState &from, const HangulTextState &to,
+                               qsizetype edits)
+{
+    if (!from.caret.isValid() || !to.caret.isValid())
+        return true;
+    const int lineHeight = std::max({ from.caret.height(), to.caret.height(), 1 });
+    const int steps = int(std::max<qsizetype>(edits, 1));
+    const int dx = std::abs(to.caret.x() - from.caret.x());
+    const int dy = std::abs(to.caret.y() - from.caret.y());
+    if (dy <= lineHeight / 2)
+        return dx <= 4 * lineHeight * steps;
+    return dy <= (3 * lineHeight / 2) * steps;
 }
 
 static const HangulTextState &modelState()
@@ -371,7 +397,7 @@ static void stopTracking()
     modelValid = false;
     inflightStates.clear();
     cursorCacheUntrusted = false;
-    untrustedSnapshotCursor = -1;
+    untrustedSnapshot = HangulTextState();
     untrustedInserts.clear();
 }
 
@@ -518,7 +544,8 @@ static void sendHangulEditNow(QObject *target, const PendingHangulEdit &edit)
     }
 }
 
-enum class CacheMatch { Behind, Current, Mismatch };
+// ForeignCaret: text and cursor match, but the caret is in another field.
+enum class CacheMatch { Behind, Current, Mismatch, ForeignCaret };
 
 // Matches the cache against the tracked states. Confirms in-flight edits the
 // cache already reflects. `cacheCursor` receives the cached cursor.
@@ -530,8 +557,12 @@ static CacheMatch reconcileCache(QObject *target, int *cacheCursor)
     *cacheCursor = cache.cursor;
 
     if (cursorCacheUntrusted) {
-        if (cache.cursor == untrustedSnapshotCursor)
+        // Text, cursor and selection together: replacing a selection and then
+        // inserting can bring the cursor back to where it was.
+        if (sameTextAndCursor(cache, untrustedSnapshot)
+            && cache.anchor == untrustedSnapshot.anchor) {
             return CacheMatch::Behind;
+        }
         const qsizetype inserted = untrustedInserts.length();
         if (inserted > 0
             && (cache.cursor < inserted
@@ -539,7 +570,7 @@ static CacheMatch reconcileCache(QObject *target, int *cacheCursor)
             return CacheMatch::Behind;
         }
         qCDebug(lcQpaKeys) << "Hangul composer: cursor cache caught up after foreign key"
-                           << untrustedSnapshotCursor << "->" << cache.cursor;
+                           << untrustedSnapshot.cursor << "->" << cache.cursor;
         stopTracking();
         return CacheMatch::Current;
     }
@@ -548,6 +579,14 @@ static CacheMatch reconcileCache(QObject *target, int *cacheCursor)
 
     for (qsizetype i = inflightStates.size() - 1; i >= 0; --i) {
         if (sameTextAndCursor(cache, inflightStates.at(i))) {
+            if (!caretMovePlausible(confirmedState, cache, i + 1)) {
+                // Same text and cursor in a field elsewhere on the page: not
+                // ours. Keep waiting; without progress the stall cap drops it.
+                qCDebug(lcQpaKeys) << "Hangul composer: cache matches edit" << (i + 1)
+                                   << "but the caret jumped" << confirmedState.caret
+                                   << "->" << cache.caret;
+                return CacheMatch::ForeignCaret;
+            }
             qCDebug(lcQpaKeys) << "Hangul composer: cache reached edit" << (i + 1) << "of"
                                << inflightStates.size() << "at cursor" << cache.cursor;
             confirmedState = cache;
@@ -557,7 +596,10 @@ static CacheMatch reconcileCache(QObject *target, int *cacheCursor)
         }
     }
     if (sameTextAndCursor(cache, confirmedState)) {
+        if (!caretMovePlausible(confirmedState, cache, 0))
+            return CacheMatch::ForeignCaret;
         confirmedState.anchor = cache.anchor;
+        confirmedState.caret = cache.caret;
         return inflightStates.isEmpty() ? CacheMatch::Current : CacheMatch::Behind;
     }
     return CacheMatch::Mismatch;
@@ -584,7 +626,7 @@ static void drainHeldHangulEdits()
         abandonForChangedTarget(false);
         return;
     }
-    if (cursorCacheUntrusted)
+    if (cursorCacheUntrusted || match == CacheMatch::ForeignCaret)
         return;
     while (!heldEdits.isEmpty() && canSendAt(cacheCursor)) {
         const PendingHangulEdit edit = heldEdits.takeFirst();
@@ -619,7 +661,8 @@ static void sendHangulEdit(QObject *focusObject, const PendingHangulEdit &edit)
             abandonForChangedTarget(true);
             return;
         }
-        if (!cursorCacheUntrusted && canSendAt(cacheCursor)) {
+        if (!cursorCacheUntrusted && match != CacheMatch::ForeignCaret
+            && canSendAt(cacheCursor)) {
             sendHangulEditNow(focusObject, edit);
             return;
         }
@@ -674,6 +717,18 @@ static void syncComposerWithTarget(QObject *focusObject)
         composerResetPending = false;
         return;
     }
+    if (cursorCacheUntrusted && untrustedInserts.isEmpty() && heldEdits.isEmpty()
+        && focusObject == editTarget) {
+        // A foreign key that has changed the text ended the composition; the
+        // model is rebuilt from the cache that now shows its edit.
+        HangulTextState cache;
+        if (queryTextState(focusObject, &cache) && cache.text != untrustedSnapshot.text) {
+            qCDebug(lcQpaKeys) << "Hangul composer: foreign key edit reported - reset";
+            composer.reset();
+            stopTracking();
+        }
+        return;
+    }
     if (!focusObject || focusObject != editTarget || !modelValid
         || hasPendingHangulEdits() || !composer.hasState())
         return;
@@ -719,11 +774,12 @@ static void markCursorCacheUntrusted(QObject *focusObject)
 {
     if (!focusObject)
         return;
-    if (auto qr = queryInputMethod(focusObject, Qt::ImCursorPosition)) {
+    HangulTextState snapshot;
+    if (queryTextState(focusObject, &snapshot)) {
         stopTracking();
         editTarget = focusObject;
         cursorCacheUntrusted = true;
-        untrustedSnapshotCursor = qr.value(Qt::ImCursorPosition).toInt();
+        untrustedSnapshot = snapshot;
         untrustedInserts.clear();
         untrustedSince.start();
         restartStaleCursorTimer(kNoOpForeignKeyTrustMs);
@@ -1259,6 +1315,15 @@ bool hangulComposerHookKeyDown(QNSView *view, NSEvent *nsevent)
 
         if (composer.hasState() && !hasSelection) {
             composer.handleBackspace(view);
+        } else if (cursorCacheUntrusted && heldEdits.isEmpty() && untrustedInserts.isEmpty()) {
+            // After a foreign key the cache may not show its edit yet. Deliver
+            // the delete as a key event (IMK still bypassed) so the renderer
+            // applies it in order at its own caret, without a cached range.
+            composer.reset();
+            KeyEvent keyEvent(nsevent);
+            keyEvent.text = {};
+            qCDebug(lcQpaKeys) << "Hangul composer: backspace after foreign key sent as" << keyEvent;
+            keyEvent.sendWindowSystemEvent([view topLevelWindow]);
         } else {
             composer.reset();
             if (focusObject && queryInputMethod(focusObject))
