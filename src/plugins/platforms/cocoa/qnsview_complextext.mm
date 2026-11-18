@@ -289,13 +289,19 @@ void hangulComposerMarkFlagsChanged() { flagsChangedPending = true; }
 //     keyDown, so stale edits never land in another field.
 //   - Backspace is held as an intent and resolved against the selection that
 //     exists when it is sent, not when the key was pressed.
-//   - If the cache stays behind the model for kStaleCursorTimeoutMs, the
-//     queue is sent as-is (pre-guard behavior).
-//   - Keys the composer does not own wait up to kForeignKeyWaitMs in
-//     hookKeyDown so they cannot overtake held edits. Such a key edits
-//     through the stock path, so the model is rebuilt from the cache once the
-//     cursor moves away from the value seen before that key, or after
-//     kStaleCursorTimeoutMs.
+//   - No edit is ever sent unverified. While the cache stays behind the
+//     model the queue keeps waiting; a cache that never converges is caught
+//     as a mismatch above. Only if the renderer makes no progress at all for
+//     kRendererStallCapMs are held edits dropped and the composer reset.
+//   - Keys the composer does not own wait in hookKeyDown until every sent
+//     edit is confirmed and the queue is empty (up to kRendererStallCapMs,
+//     then held edits are dropped), so they cannot overtake composer edits and
+//     the cache is current when they start. Such a key edits through the stock
+//     path; afterwards plain inserts go out at once (the renderer inserts at
+//     its own caret), and relative edits wait until the cache shows those
+//     inserts before the caret, then the model is rebuilt from the cache. When
+//     nothing was inserted, the cache is trusted once its cursor moves or after
+//     kNoOpForeignKeyTrustMs (keys that change nothing, e.g. Esc).
 // Widgets that answer input method queries synchronously always match the
 // model, so the queue never forms for them.
 
@@ -312,8 +318,8 @@ struct PendingHangulEdit {
     int replaceLength = 0;
 };
 
-static const int kStaleCursorTimeoutMs = 300;
-static const int kForeignKeyWaitMs = 200;
+static const int kRendererStallCapMs = 3000;
+static const int kNoOpForeignKeyTrustMs = 300;
 
 static QPointer<QObject> editTarget;
 static QList<PendingHangulEdit> heldEdits;
@@ -322,6 +328,8 @@ static HangulTextState confirmedState;      // last state the cache was seen in
 static QList<HangulTextState> inflightStates; // expected states of sent, unconfirmed edits
 static bool cursorCacheUntrusted = false;   // a foreign key has not been reported yet
 static int untrustedSnapshotCursor = -1;
+static QString untrustedInserts;            // plain inserts sent since the foreign key
+static QElapsedTimer untrustedSince;
 static bool composerResetPending = false;   // target changed under held edits
 static bool sendingCommit = false;
 static QTimer *staleCursorTimer = nullptr;
@@ -364,6 +372,7 @@ static void stopTracking()
     inflightStates.clear();
     cursorCacheUntrusted = false;
     untrustedSnapshotCursor = -1;
+    untrustedInserts.clear();
 }
 
 static void clearPendingHangulEdits()
@@ -391,36 +400,35 @@ static void abandonForChangedTarget(bool insideComposerEmit)
         composer.reset();
 }
 
-static void flushHeldHangulEditsUnchecked();
 static void drainHeldHangulEdits();
 
 static void onStaleCursorTimeout()
 {
-    if (cursorCacheUntrusted) {
+    if (cursorCacheUntrusted && untrustedInserts.isEmpty()
+        && untrustedSince.elapsed() < kRendererStallCapMs) {
         qCDebug(lcQpaKeys) << "Hangul composer: cursor cache unchanged after foreign key"
                            << "- trusting it";
-        cursorCacheUntrusted = false;
-        untrustedSnapshotCursor = -1;
+        stopTracking();
         drainHeldHangulEdits();
         return;
     }
-    if (hasHeldHangulEdits()) {
-        qCDebug(lcQpaKeys) << "Hangul composer: cursor cache did not catch up - flushing"
-                           << heldEdits.size() << "held edit(s) unchecked";
-        flushHeldHangulEditsUnchecked();
+    if (hasPendingHangulEdits()) {
+        qCDebug(lcQpaKeys) << "Hangul composer: renderer made no progress for"
+                           << kRendererStallCapMs << "ms";
+        abandonForChangedTarget(false);
         return;
     }
     stopTracking();
 }
 
-static void restartStaleCursorTimer()
+static void restartStaleCursorTimer(int intervalMs = kRendererStallCapMs)
 {
     if (!staleCursorTimer) {
         staleCursorTimer = new QTimer;
         staleCursorTimer->setSingleShot(true);
         QObject::connect(staleCursorTimer, &QTimer::timeout, &onStaleCursorTimeout);
     }
-    staleCursorTimer->start(kStaleCursorTimeoutMs);
+    staleCursorTimer->start(intervalMs);
 }
 
 // Resolves an edit against `state`: a held Backspace deletes the selection
@@ -510,23 +518,6 @@ static void sendHangulEditNow(QObject *target, const PendingHangulEdit &edit)
     }
 }
 
-// Sends held edits as-is without tracking (timeout and focus-object change).
-static void flushHeldHangulEditsUnchecked()
-{
-    QObject *target = editTarget;
-    const QList<PendingHangulEdit> edits = heldEdits;
-    clearPendingHangulEdits();
-    if (!target)
-        return;
-    for (const PendingHangulEdit &edit : edits) {
-        HangulTextState state;
-        const bool known = queryTextState(target, &state);
-        PendingHangulEdit resolved;
-        if (resolveEdit(edit, state, known, &resolved))
-            sendInputMethodEvent(target, resolved);
-    }
-}
-
 enum class CacheMatch { Behind, Current, Mismatch };
 
 // Matches the cache against the tracked states. Confirms in-flight edits the
@@ -541,7 +532,13 @@ static CacheMatch reconcileCache(QObject *target, int *cacheCursor)
     if (cursorCacheUntrusted) {
         if (cache.cursor == untrustedSnapshotCursor)
             return CacheMatch::Behind;
-        qCDebug(lcQpaKeys) << "Hangul composer: cursor cache moved after foreign key"
+        const qsizetype inserted = untrustedInserts.length();
+        if (inserted > 0
+            && (cache.cursor < inserted
+                || cache.text.mid(cache.cursor - inserted, inserted) != untrustedInserts)) {
+            return CacheMatch::Behind;
+        }
+        qCDebug(lcQpaKeys) << "Hangul composer: cursor cache caught up after foreign key"
                            << untrustedSnapshotCursor << "->" << cache.cursor;
         stopTracking();
         return CacheMatch::Current;
@@ -555,6 +552,7 @@ static CacheMatch reconcileCache(QObject *target, int *cacheCursor)
                                << inflightStates.size() << "at cursor" << cache.cursor;
             confirmedState = cache;
             inflightStates.remove(0, i + 1);
+            restartStaleCursorTimer();
             return CacheMatch::Current;
         }
     }
@@ -604,8 +602,11 @@ static void sendHangulEdit(QObject *focusObject, const PendingHangulEdit &edit)
         return;
     }
     if (editTarget && editTarget != focusObject && hasPendingHangulEdits()) {
-        qCDebug(lcQpaKeys) << "Hangul composer: focus object moved - flushing held edits";
-        flushHeldHangulEditsUnchecked();
+        // Cocoa resets the composer on a focus-object change; edits held for
+        // the previous object cannot be verified any more, so drop them.
+        qCDebug(lcQpaKeys) << "Hangul composer: focus object moved - dropping"
+                           << heldEdits.size() << "held edit(s)";
+        clearPendingHangulEdits();
     }
     if (editTarget != focusObject) {
         stopTracking();
@@ -622,6 +623,16 @@ static void sendHangulEdit(QObject *focusObject, const PendingHangulEdit &edit)
             sendHangulEditNow(focusObject, edit);
             return;
         }
+        // The renderer inserts at its own caret, so a plain insert needs no
+        // cache; remember it to recognise the cache that reflects it.
+        const bool isPlainInsert = !edit.isBackspace && edit.replaceFrom == 0
+                                && edit.replaceLength == 0;
+        if (cursorCacheUntrusted && isPlainInsert) {
+            sendInputMethodEvent(focusObject, edit);
+            untrustedInserts += edit.text;
+            restartStaleCursorTimer();
+            return;
+        }
     }
     qCDebug(lcQpaKeys) << "Hangul composer: holding" << (edit.isBackspace ? "backspace" : "commit")
                        << edit.replaceFrom << edit.replaceLength << "behind"
@@ -629,7 +640,8 @@ static void sendHangulEdit(QObject *focusObject, const PendingHangulEdit &edit)
                        << cursorCacheUntrusted;
     heldEdits.append(edit);
     if (!staleCursorTimer || !staleCursorTimer->isActive())
-        restartStaleCursorTimer();
+        restartStaleCursorTimer(cursorCacheUntrusted && untrustedInserts.isEmpty()
+                                    ? kNoOpForeignKeyTrustMs : kRendererStallCapMs);
 }
 
 static void sendHangulCommit(QObject *focusObject, const QString &text,
@@ -674,26 +686,29 @@ static void syncComposerWithTarget(QObject *focusObject)
 }
 
 // Keys the composer does not own (space, enter, punctuation, navigation,
-// shortcuts) go through the stock path. Let held edits land first so they
-// keep their order; past kForeignKeyWaitMs, send them unchecked.
-static void waitForHeldHangulEdits()
+// shortcuts) go through the stock path. Let every sent edit be confirmed and
+// held edits land first, so the key keeps its order and the cache is current
+// when it starts. If the renderer makes no progress for kRendererStallCapMs,
+// held edits are dropped rather than sent unverified.
+static void waitForHangulEditsToLand()
 {
-    if (!hasHeldHangulEdits())
+    if (!hasPendingHangulEdits())
         return;
     QElapsedTimer elapsed;
     elapsed.start();
-    while (hasHeldHangulEdits() && elapsed.elapsed() < kForeignKeyWaitMs) {
+    while (hasPendingHangulEdits() && elapsed.elapsed() < kRendererStallCapMs) {
         QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-        if (hasHeldHangulEdits())
+        drainHeldHangulEdits();
+        if (hasPendingHangulEdits())
             QThread::msleep(1);
     }
-    if (hasHeldHangulEdits()) {
+    if (hasPendingHangulEdits()) {
         qCDebug(lcQpaKeys) << "Hangul composer: foreign key waited" << elapsed.elapsed()
-                           << "ms - flushing held edits unchecked";
-        flushHeldHangulEditsUnchecked();
+                           << "ms without renderer progress";
+        abandonForChangedTarget(false);
     } else {
         qCDebug(lcQpaKeys) << "Hangul composer: foreign key waited" << elapsed.elapsed()
-                           << "ms for held edits";
+                           << "ms for sent edits";
     }
 }
 
@@ -709,7 +724,9 @@ static void markCursorCacheUntrusted(QObject *focusObject)
         editTarget = focusObject;
         cursorCacheUntrusted = true;
         untrustedSnapshotCursor = qr.value(Qt::ImCursorPosition).toInt();
-        restartStaleCursorTimer();
+        untrustedInserts.clear();
+        untrustedSince.start();
+        restartStaleCursorTimer(kNoOpForeignKeyTrustMs);
     }
 }
 
@@ -1172,7 +1189,7 @@ bool hangulComposerHookKeyDown(QNSView *view, NSEvent *nsevent)
                        << (isForeignKey ? "foreign" : "composer-owned");
     syncComposerWithTarget(view.focusObject);
     if (isForeignKey)
-        waitForHeldHangulEdits();
+        waitForHangulEditsToLand();
     bool sentByPredispatch = false;
 
     composer.enterRound(c);
