@@ -3,6 +3,11 @@
 
 // This file is included from qnsview.mm, and only used to organize the code
 
+#include <QtCore/QElapsedTimer>
+#include <QtCore/QList>
+#include <QtCore/QThread>
+#include <QtCore/QTimer>
+
 // ============================================================================
 // Hangul composer — workaround for QTBUG-136128 / FB17460926.
 //
@@ -255,6 +260,283 @@ static const NSTimeInterval postFlagWindowSec = 0.2;
 void hangulComposerMarkFlagsChanged() { flagsChangedPending = true; }
 
 
+// ============================================================================
+// Stale-cursor guard for commit-only emits.
+// ============================================================================
+//
+// Composer emits replace earlier text relative to the cursor
+// (setCommitString(text, -N, N)). QtWebEngine resolves that relative start
+// against a browser-side cursor cache (m_cursorPosition) that is refreshed
+// only when the renderer asynchronously reports its TextInputState. When the
+// renderer is busy, a replacement sent right after an insertion is resolved
+// against the pre-insertion cursor: the wrong character is replaced, or the
+// range falls outside the cached text and the commit is appended instead.
+//
+// Guard: after sending a commit that moves the cursor, remember the cursor
+// we expect, and hold every later commit in a queue until
+// ImCursorPosition reports that value. The cache refresh ends in
+// QInputMethod::update() -> QCocoaInputContext::update(), which calls
+// hangulComposerOnInputMethodUpdate() to resume the queue.
+//   - Cursor-neutral commits (same-length replacement) do not wait: the next
+//     relative range stays valid against an unchanged cursor.
+//   - If the cache does not reach the expected cursor within
+//     kStaleCursorTimeoutMs, the queue is sent as-is (pre-guard behavior).
+//   - Keys the composer does not own wait up to kForeignKeyWaitMs in
+//     hookKeyDown so they cannot overtake queued commits.
+//   - A foreign key edits through the stock path, so the cache is not a valid
+//     base for the next expected cursor until it moves away from the value
+//     seen before that key. Composer commits are held until it does, or
+//     until kStaleCursorTimeoutMs passes, after which the cache is trusted.
+// Widgets that answer ImCursorPosition synchronously always match the
+// expected cursor, so the queue never forms for them.
+
+struct PendingHangulCommit {
+    QString text;
+    int replaceFrom;
+    int replaceLength;
+};
+
+static const int kStaleCursorTimeoutMs = 300;
+static const int kForeignKeyWaitMs = 200;
+
+static QPointer<QObject> pendingCommitTarget;
+static QList<PendingHangulCommit> pendingCommits;
+static int awaitedCursor = -1;            // -1: no composer commit in flight
+static bool cursorCacheUntrusted = false; // a foreign key has not been reported yet
+static int untrustedSnapshotCursor = -1;
+static bool sendingCommit = false;
+static QTimer *staleCursorTimer = nullptr;
+
+// Composer commits that a foreign key must not overtake.
+static bool hasHeldHangulCommits()
+{
+    return awaitedCursor >= 0 || !pendingCommits.isEmpty();
+}
+
+static bool hasPendingHangulCommits()
+{
+    return hasHeldHangulCommits() || cursorCacheUntrusted;
+}
+
+static void clearPendingHangulCommits()
+{
+    pendingCommits.clear();
+    awaitedCursor = -1;
+    cursorCacheUntrusted = false;
+    untrustedSnapshotCursor = -1;
+    pendingCommitTarget = nullptr;
+    if (staleCursorTimer)
+        staleCursorTimer->stop();
+}
+
+static void flushPendingHangulCommitsUnchecked();
+static void drainPendingHangulCommits();
+
+static void onStaleCursorTimeout()
+{
+    if (awaitedCursor >= 0) {
+        qCDebug(lcQpaKeys) << "Hangul composer: cursor cache did not reach"
+                           << awaitedCursor << "- flushing" << pendingCommits.size()
+                           << "held commit(s) unchecked";
+        flushPendingHangulCommitsUnchecked();
+        return;
+    }
+    if (cursorCacheUntrusted) {
+        qCDebug(lcQpaKeys) << "Hangul composer: cursor cache unchanged after foreign key"
+                           << "- trusting it";
+        cursorCacheUntrusted = false;
+        untrustedSnapshotCursor = -1;
+        drainPendingHangulCommits();
+    }
+}
+
+static void startStaleCursorTimer()
+{
+    if (!staleCursorTimer) {
+        staleCursorTimer = new QTimer;
+        staleCursorTimer->setSingleShot(true);
+        QObject::connect(staleCursorTimer, &QTimer::timeout, &onStaleCursorTimeout);
+    }
+    staleCursorTimer->start(kStaleCursorTimeoutMs);
+}
+
+// Sends one commit now. When it moves the cursor, records the cursor the
+// renderer will report once it has applied the commit.
+static void sendHangulCommitNow(QObject *focusObject, const PendingHangulCommit &commit,
+                                bool trackCursor)
+{
+    int expected = -1;
+    if (trackCursor) {
+        if (auto qr = queryInputMethod(focusObject,
+                Qt::ImAnchorPosition | Qt::ImCursorPosition)) {
+            const int anchor = qr.value(Qt::ImAnchorPosition).toInt();
+            const int cursor = qr.value(Qt::ImCursorPosition).toInt();
+            // A plain insert replaces the current selection, if any.
+            const bool isPlainInsert = (commit.replaceFrom == 0 && commit.replaceLength == 0);
+            const int base = isPlainInsert ? std::min(anchor, cursor) : cursor;
+            expected = base + commit.replaceFrom + int(commit.text.length());
+            if (expected == cursor)
+                expected = -1;
+        }
+    }
+
+    QInputMethodEvent ev;
+    ev.setCommitString(commit.text, commit.replaceFrom, commit.replaceLength);
+    sendingCommit = true;
+    QCoreApplication::sendEvent(focusObject, &ev);
+    sendingCommit = false;
+
+    if (expected >= 0) {
+        pendingCommitTarget = focusObject;
+        awaitedCursor = expected;
+        startStaleCursorTimer();
+    }
+}
+
+static void flushPendingHangulCommitsUnchecked()
+{
+    QObject *target = pendingCommitTarget;
+    const QList<PendingHangulCommit> commits = pendingCommits;
+    clearPendingHangulCommits();
+    if (!target)
+        return;
+    for (const PendingHangulCommit &commit : commits)
+        sendHangulCommitNow(target, commit, false);
+}
+
+// Returns true once the cursor cache can be used as the base for the next
+// commit: the awaited cursor was reported, or the cache moved after a
+// foreign key.
+static bool cursorCacheCaughtUp(QObject *target)
+{
+    if (awaitedCursor < 0 && !cursorCacheUntrusted)
+        return true;
+    auto qr = queryInputMethod(target, Qt::ImCursorPosition);
+    if (!qr)
+        return false;
+    const int cursor = qr.value(Qt::ImCursorPosition).toInt();
+    if (awaitedCursor >= 0) {
+        if (cursor != awaitedCursor)
+            return false;
+        qCDebug(lcQpaKeys) << "Hangul composer: cursor cache reached" << awaitedCursor;
+        awaitedCursor = -1;
+    } else {
+        if (cursor == untrustedSnapshotCursor)
+            return false;
+        qCDebug(lcQpaKeys) << "Hangul composer: cursor cache moved after foreign key"
+                           << untrustedSnapshotCursor << "->" << cursor;
+        cursorCacheUntrusted = false;
+        untrustedSnapshotCursor = -1;
+    }
+    if (staleCursorTimer)
+        staleCursorTimer->stop();
+    return true;
+}
+
+// Sends held commits while the cursor cache is caught up, stopping at the
+// first commit that moves the cursor again.
+static void drainPendingHangulCommits()
+{
+    if (sendingCommit)
+        return;
+    QObject *target = pendingCommitTarget;
+    if (!target) {
+        clearPendingHangulCommits();
+        return;
+    }
+    if (!cursorCacheCaughtUp(target))
+        return;
+    while (awaitedCursor < 0 && !pendingCommits.isEmpty()) {
+        const PendingHangulCommit commit = pendingCommits.takeFirst();
+        sendHangulCommitNow(target, commit, true);
+    }
+    if (!hasPendingHangulCommits())
+        pendingCommitTarget = nullptr;
+}
+
+// Single send path for every composer-originated commit.
+static void sendHangulCommit(QObject *focusObject, const QString &text,
+                             int replaceFrom, int replaceLength)
+{
+    if (hasPendingHangulCommits() && pendingCommitTarget != focusObject) {
+        qCDebug(lcQpaKeys) << "Hangul composer: focus moved - flushing held commits";
+        flushPendingHangulCommitsUnchecked();
+    }
+    if (hasPendingHangulCommits())
+        drainPendingHangulCommits();
+
+    const PendingHangulCommit commit{ text, replaceFrom, replaceLength };
+    if (hasPendingHangulCommits()) {
+        qCDebug(lcQpaKeys) << "Hangul composer: holding commit" << text << replaceFrom
+                           << replaceLength << "awaited cursor" << awaitedCursor
+                           << "untrusted cache" << cursorCacheUntrusted;
+        pendingCommitTarget = focusObject;
+        pendingCommits.append(commit);
+        return;
+    }
+    sendHangulCommitNow(focusObject, commit, true);
+}
+
+// Called from QCocoaInputContext::update() whenever the focus object reports
+// an input method state change (QtWebEngine: after a cursor cache refresh).
+void hangulComposerOnInputMethodUpdate()
+{
+    if (hasPendingHangulCommits())
+        drainPendingHangulCommits();
+}
+
+// Keys the composer does not own (space, enter, punctuation, navigation,
+// shortcuts) go through the stock path. Let held commits land first so they
+// keep their order; past kForeignKeyWaitMs, send them unchecked.
+static void waitForHeldHangulCommits()
+{
+    if (!hasHeldHangulCommits())
+        return;
+    QElapsedTimer elapsed;
+    elapsed.start();
+    while (hasHeldHangulCommits() && elapsed.elapsed() < kForeignKeyWaitMs) {
+        QCoreApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
+        if (hasHeldHangulCommits())
+            QThread::msleep(1);
+    }
+    if (hasHeldHangulCommits()) {
+        qCDebug(lcQpaKeys) << "Hangul composer: foreign key waited" << elapsed.elapsed()
+                           << "ms - flushing held commits unchecked";
+        flushPendingHangulCommitsUnchecked();
+    } else {
+        qCDebug(lcQpaKeys) << "Hangul composer: foreign key waited" << elapsed.elapsed()
+                           << "ms for held commits";
+    }
+}
+
+// The stock path is about to edit the text for a foreign key. Until the
+// cursor cache moves away from its current value it does not reflect that
+// edit, so it cannot be the base for the next composer commit.
+static void markCursorCacheUntrusted(QObject *focusObject)
+{
+    if (!focusObject)
+        return;
+    if (auto qr = queryInputMethod(focusObject, Qt::ImCursorPosition)) {
+        pendingCommitTarget = focusObject;
+        cursorCacheUntrusted = true;
+        untrustedSnapshotCursor = qr.value(Qt::ImCursorPosition).toInt();
+        startStaleCursorTimer();
+    }
+}
+
+static bool isComposerOwnedKey(NSEvent *nsevent, unichar c)
+{
+    if (c == 0x08 || c == 0x7F)
+        return true;
+    const bool hasModifier = (nsevent.modifierFlags
+        & (NSEventModifierFlagCommand | NSEventModifierFlagControl
+           | NSEventModifierFlagOption)) != 0;
+    if (hasModifier)
+        return false;
+    return (c >= 0x3131 && c <= 0x3163) || (c >= 0xAC00 && c <= 0xD7A3);
+}
+
+
 // --- HangulComposer method bodies ---
 
 void HangulComposer::reset()
@@ -315,17 +597,13 @@ void HangulComposer::emitCurrent(QNSView *view)
         preview = QString(QChar(ushort(0x314F + jung)));
     } else {
         if (lastCommittedLen > 0) {
-            QInputMethodEvent ev;
-            ev.setCommitString(QString(), -lastCommittedLen, lastCommittedLen);
-            QCoreApplication::sendEvent(focusObject, &ev);
+            sendHangulCommit(focusObject, QString(), -lastCommittedLen, lastCommittedLen);
         }
         lastCommittedLen = 0;
         return;
     }
 
-    QInputMethodEvent ev;
-    ev.setCommitString(preview, -lastCommittedLen, lastCommittedLen);
-    QCoreApplication::sendEvent(focusObject, &ev);
+    sendHangulCommit(focusObject, preview, -lastCommittedLen, lastCommittedLen);
     lastCommittedLen = preview.length();
 }
 
@@ -582,9 +860,7 @@ void HangulComposer::feedSyllable(QNSView *view, QChar ch)
             if (diffJung || diffJong) {
                 const int prevIdx = (cho * 21 + jung) * 28 + rem;
                 const QChar prev(ushort(0xAC00 + prevIdx));
-                QInputMethodEvent ev;
-                ev.setCommitString(QString(prev), -lastCommittedLen, lastCommittedLen);
-                QCoreApplication::sendEvent(focusObject, &ev);
+                sendHangulCommit(focusObject, QString(prev), -lastCommittedLen, lastCommittedLen);
                 jong = rem;
                 lastCommittedLen = 0;
                 return;
@@ -609,9 +885,7 @@ void HangulComposer::feedSyllable(QNSView *view, QChar ch)
             QString combined;
             combined.append(prev);
             combined.append(ch);
-            QInputMethodEvent ev;
-            ev.setCommitString(combined, -lastCommittedLen, lastCommittedLen);
-            QCoreApplication::sendEvent(focusObject, &ev);
+            sendHangulCommit(focusObject, combined, -lastCommittedLen, lastCommittedLen);
             lastCommittedLen = 1;
             cho = inCho;
             jung = inJung;
@@ -622,23 +896,19 @@ void HangulComposer::feedSyllable(QNSView *view, QChar ch)
 
     // cho mismatch: rewind prev emit, strip jong
     if (cho >= 0 && cho != inCho && lastCommittedLen > 0) {
-        QInputMethodEvent ev;
         if (jong > 0 && jung >= 0) {
             const int fixedIdx = (cho * 21 + jung) * 28 + 0;
             const QChar fixed(ushort(0xAC00 + fixedIdx));
             QString combined;
             combined.append(fixed);
             combined.append(ch);
-            ev.setCommitString(combined, -lastCommittedLen, lastCommittedLen);
+            sendHangulCommit(focusObject, combined, -lastCommittedLen, lastCommittedLen);
         } else {
-            ev.setCommitString(QString(ch), 0, 0);
+            sendHangulCommit(focusObject, QString(ch), 0, 0);
         }
-        QCoreApplication::sendEvent(focusObject, &ev);
         lastCommittedLen = 1;
     } else {
-        QInputMethodEvent ev;
-        ev.setCommitString(QString(ch), -lastCommittedLen, lastCommittedLen);
-        QCoreApplication::sendEvent(focusObject, &ev);
+        sendHangulCommit(focusObject, QString(ch), -lastCommittedLen, lastCommittedLen);
         lastCommittedLen = 1;
     }
 
@@ -708,6 +978,13 @@ bool hangulComposerHookKeyDown(QNSView *view, NSEvent *nsevent)
         return false;
     const unichar c = [chars characterAtIndex:0];
 
+    const bool isForeignKey = !isComposerOwnedKey(nsevent, c);
+    qCDebug(lcQpaKeys) << "Hangul composer: keyDown" << QString(QChar(c))
+                       << (isForeignKey ? "foreign" : "composer-owned");
+    if (isForeignKey)
+        waitForHeldHangulCommits();
+    bool sentByPredispatch = false;
+
     composer.enterRound(c);
 
     // 한영 직후 첫 keyDown — parallel predispatch + dup window.
@@ -734,14 +1011,18 @@ bool hangulComposerHookKeyDown(QNSView *view, NSEvent *nsevent)
             } else {
                 QObject *focusObject = view.focusObject;
                 if (focusObject && queryInputMethod(focusObject)) {
-                    QInputMethodEvent ev;
-                    ev.setCommitString(QString::fromNSString(chars), 0, 0);
-                    QCoreApplication::sendEvent(focusObject, &ev);
+                    sendHangulCommit(focusObject, QString::fromNSString(chars), 0, 0);
+                    sentByPredispatch = true;
                 }
             }
             // Fall through (return false) so stock path also runs.
         }
     }
+
+    // The predispatched commit is tracked like a composer commit and the
+    // stock duplicate is suppressed, so only a stock-path edit needs this.
+    if (isForeignKey && !sentByPredispatch)
+        markCursorCacheUntrusted(view.focusObject);
 
     // space / tab / enter — Apple IME treats as commit-and-insert. Drop our
     // cycle + Apple's marked buffer to avoid syllable finalize duplicates
@@ -773,17 +1054,13 @@ bool hangulComposerHookKeyDown(QNSView *view, NSEvent *nsevent)
             if (focusObject && queryInputMethod(focusObject)) {
                 const int selStart = std::min(anchor, cursor);
                 const int selEnd   = std::max(anchor, cursor);
-                QInputMethodEvent ev;
-                ev.setCommitString(QString(), selStart - cursor, selEnd - selStart);
-                QCoreApplication::sendEvent(focusObject, &ev);
+                sendHangulCommit(focusObject, QString(), selStart - cursor, selEnd - selStart);
             }
         } else if (composer.hasState()) {
             composer.handleBackspace(view);
         } else {
             if (focusObject && queryInputMethod(focusObject)) {
-                QInputMethodEvent ev;
-                ev.setCommitString(QString(), -1, 1);
-                QCoreApplication::sendEvent(focusObject, &ev);
+                sendHangulCommit(focusObject, QString(), -1, 1);
             }
         }
         [view.inputContext discardMarkedText];

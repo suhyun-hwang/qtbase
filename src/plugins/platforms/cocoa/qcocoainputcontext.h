@@ -25,6 +25,7 @@ public:
 
     void commit() override;
     void reset() override;
+    void update(Qt::InputMethodQueries queries) override;
 
     QLocale locale() const override { return m_locale; }
     void updateLocale();

@@ -15,6 +15,9 @@
 #include <QtGui/QGuiApplication>
 #include <QtGui/QWindow>
 
+// Defined in qnsview_complextext.mm (Hangul composer, QTBUG-136128 workaround).
+extern void hangulComposerOnInputMethodUpdate();
+
 QT_BEGIN_NAMESPACE
 
 /*!
@@ -112,6 +115,17 @@ void QCocoaInputContext::reset()
         [ctxt discardMarkedText];
         [view unmarkText];
     }
+}
+
+/*!
+    \brief Resumes Hangul composer commits held until the focus object's
+    cursor position is reported (see qnsview_complextext.mm).
+*/
+void QCocoaInputContext::update(Qt::InputMethodQueries queries)
+{
+    QPlatformInputContext::update(queries);
+    if (queries & Qt::ImCursorPosition)
+        hangulComposerOnInputMethodUpdate();
 }
 
 void QCocoaInputContext::setFocusObject(QObject *focusObject)
